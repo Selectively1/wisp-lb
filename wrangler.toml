@@ -11,6 +11,14 @@ UPSTREAMS = "wss://wisp1.example.com/wisp,wss://wisp2.example.com/wisp"
 name = "WISP_PROXY"
 class_name = "WispProxy"
 
+[[durable_objects.bindings]]
+name = "UPSTREAM_REGISTRY"
+class_name = "UpstreamRegistry"
+
 [[migrations]]
 tag = "v1"
 new_classes = ["WispProxy"]
+
+[[migrations]]
+tag = "v2"
+new_classes = ["UpstreamRegistry"]
