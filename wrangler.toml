@@ -1,0 +1,16 @@
+name = "wisp-lb"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[vars]
+# Comma-separated list of upstream Wisp server WebSocket URLs
+# Override in wrangler.toml or via `wrangler secret put UPSTREAMS`
+UPSTREAMS = "wss://wisp1.example.com/wisp,wss://wisp2.example.com/wisp"
+
+[[durable_objects.bindings]]
+name = "WISP_PROXY"
+class_name = "WispProxy"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["WispProxy"]
