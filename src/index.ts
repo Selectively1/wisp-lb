@@ -7,6 +7,11 @@ export interface Env {
   UPSTREAMS: string;
 }
 
+/** State persisted on each client WebSocket via serializeAttachment. */
+interface WsAttachment {
+  upstreamUrl: string;
+}
+
 // ── Worker Entrypoint ──────────────────────────────────────────────────────────
 
 export default {
@@ -58,11 +63,35 @@ export default {
 } satisfies ExportedHandler<Env>;
 
 // ── Durable Object: WispProxy ──────────────────────────────────────────────────
+//
+// Uses the WebSocket Hibernation API for the client-facing connection.
+// During idle periods the DO can be evicted from memory while keeping the
+// client WebSocket alive on the Cloudflare edge.  When a message arrives
+// from the client the DO is re-instantiated and the upstream connection is
+// re-established transparently.
+//
+// The upstream (outgoing) WebSocket uses the standard API since hibernation
+// only applies to server-side WebSockets.
+// ────────────────────────────────────────────────────────────────────────────────
 
 export class WispProxy extends DurableObject<Env> {
-  private clientWs: WebSocket | null = null;
   private upstreamWs: WebSocket | null = null;
   private closed = false;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+
+    // On wake-from-hibernation the constructor runs again.
+    // Restore any hibernating client WebSockets and reconnect their upstreams.
+    for (const ws of this.ctx.getWebSockets()) {
+      const attachment = ws.deserializeAttachment() as WsAttachment | null;
+      if (attachment) {
+        this.connectUpstream(ws, attachment.upstreamUrl);
+      }
+    }
+  }
+
+  // ── fetch: initial connection setup ────────────────────────────────────────
 
   async fetch(request: Request): Promise<Response> {
     const upstreamUrl = request.headers.get("X-Upstream-Url");
@@ -74,90 +103,120 @@ export class WispProxy extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const [clientSide, serverSide] = Object.values(pair);
 
-    // Accept the server side (our end of the client connection)
-    serverSide.accept();
-    this.clientWs = serverSide;
+    // Accept via Hibernation API — allows the DO to hibernate while keeping
+    // the client WebSocket alive on the edge.
+    this.ctx.acceptWebSocket(serverSide);
+
+    // Persist the upstream URL so we can reconnect after hibernation
+    serverSide.serializeAttachment({ upstreamUrl } satisfies WsAttachment);
 
     // 2. Connect to the upstream Wisp server
-    try {
-      const upstreamResp = await fetch(upstreamUrl, {
-        headers: { Upgrade: "websocket" },
-      });
-
-      const ws = upstreamResp.webSocket;
-      if (!ws) {
-        serverSide.close(1011, "Upstream did not accept WebSocket");
-        return new Response("Upstream rejected WebSocket upgrade", {
-          status: 502,
-        });
-      }
-
-      ws.accept();
-      this.upstreamWs = ws;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      serverSide.close(1011, `Upstream connection failed: ${msg}`);
-      return new Response(`Upstream connection failed: ${msg}`, {
-        status: 502,
-      });
+    const ok = await this.connectUpstream(serverSide, upstreamUrl);
+    if (!ok) {
+      // connectUpstream already closed serverSide on failure
+      return new Response("Upstream connection failed", { status: 502 });
     }
-
-    // 3. Bridge: client -> upstream
-    this.clientWs.addEventListener("message", (event: MessageEvent) => {
-      if (this.closed) return;
-      try {
-        if (event.data instanceof ArrayBuffer) {
-          this.upstreamWs?.send(event.data);
-        } else {
-          this.upstreamWs?.send(event.data as string);
-        }
-      } catch {
-        this.teardown(1011, "Failed to forward to upstream");
-      }
-    });
-
-    // 4. Bridge: upstream -> client
-    this.upstreamWs.addEventListener("message", (event: MessageEvent) => {
-      if (this.closed) return;
-      try {
-        if (event.data instanceof ArrayBuffer) {
-          this.clientWs?.send(event.data);
-        } else {
-          this.clientWs?.send(event.data as string);
-        }
-      } catch {
-        this.teardown(1011, "Failed to forward to client");
-      }
-    });
-
-    // 5. Handle close: client closed
-    this.clientWs.addEventListener("close", (event: CloseEvent) => {
-      this.teardown(event.code, event.reason || "Client closed");
-    });
-
-    // 6. Handle close: upstream closed
-    this.upstreamWs.addEventListener("close", (event: CloseEvent) => {
-      this.teardown(event.code, event.reason || "Upstream closed");
-    });
-
-    // 7. Handle errors
-    this.clientWs.addEventListener("error", () => {
-      this.teardown(1011, "Client error");
-    });
-
-    this.upstreamWs.addEventListener("error", () => {
-      this.teardown(1011, "Upstream error");
-    });
 
     // Return the client side of the WebSocket pair to the caller
     return new Response(null, { status: 101, webSocket: clientSide });
   }
 
+  // ── Hibernation event handlers ─────────────────────────────────────────────
+
+  /**
+   * Called when the client sends a WebSocket message.
+   * If the DO was hibernating this is the wake-up trigger — the constructor
+   * will have already re-established the upstream connection.
+   */
+  async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
+    if (this.closed || !this.upstreamWs) return;
+    try {
+      this.upstreamWs.send(message);
+    } catch {
+      this.teardown(ws, 1011, "Failed to forward to upstream");
+    }
+  }
+
+  /**
+   * Called when the client closes the WebSocket.
+   */
+  async webSocketClose(
+    ws: WebSocket,
+    code: number,
+    reason: string,
+    _wasClean: boolean,
+  ): Promise<void> {
+    this.teardown(ws, code, reason || "Client closed");
+  }
+
+  /**
+   * Called when the client WebSocket errors.
+   */
+  async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
+    this.teardown(ws, 1011, "Client error");
+  }
+
+  // ── Upstream connection ────────────────────────────────────────────────────
+
+  /**
+   * Open a WebSocket to the upstream Wisp server and wire up the
+   * upstream→client message bridge.
+   *
+   * Returns `true` on success, `false` on failure (caller should respond 502).
+   */
+  private async connectUpstream(
+    clientWs: WebSocket,
+    upstreamUrl: string,
+  ): Promise<boolean> {
+    try {
+      const resp = await fetch(upstreamUrl, {
+        headers: { Upgrade: "websocket" },
+      });
+
+      const ws = resp.webSocket;
+      if (!ws) {
+        clientWs.close(1011, "Upstream did not accept WebSocket");
+        return false;
+      }
+
+      ws.accept();
+      this.upstreamWs = ws;
+
+      // Bridge: upstream → client
+      ws.addEventListener("message", (event: MessageEvent) => {
+        if (this.closed) return;
+        try {
+          clientWs.send(event.data as ArrayBuffer | string);
+        } catch {
+          this.teardown(clientWs, 1011, "Failed to forward to client");
+        }
+      });
+
+      // Upstream closed
+      ws.addEventListener("close", (event: CloseEvent) => {
+        this.teardown(clientWs, event.code, event.reason || "Upstream closed");
+      });
+
+      // Upstream error
+      ws.addEventListener("error", () => {
+        this.teardown(clientWs, 1011, "Upstream error");
+      });
+
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      clientWs.close(1011, `Upstream connection failed: ${msg}`);
+      return false;
+    }
+  }
+
+  // ── Teardown ───────────────────────────────────────────────────────────────
+
   /**
    * Cleanly tear down both sides of the proxy.
-   * Safe to call multiple times -- only the first call takes effect.
+   * Safe to call multiple times — only the first call takes effect.
    */
-  private teardown(code: number, reason: string): void {
+  private teardown(clientWs: WebSocket, code: number, reason: string): void {
     if (this.closed) return;
     this.closed = true;
 
@@ -165,7 +224,7 @@ export class WispProxy extends DurableObject<Env> {
     const safeCode = code >= 1000 && code <= 4999 ? code : 1000;
 
     try {
-      this.clientWs?.close(safeCode, reason);
+      clientWs.close(safeCode, reason);
     } catch {
       // already closed
     }
@@ -176,7 +235,6 @@ export class WispProxy extends DurableObject<Env> {
       // already closed
     }
 
-    this.clientWs = null;
     this.upstreamWs = null;
   }
 }
